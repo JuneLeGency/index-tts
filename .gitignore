@@ -29,3 +29,9 @@ desktop.ini
 /checkpoints/*
 !/checkpoints/*.yaml
 /outputs/
+
+# Tinker local
+api_server.py.bak
+.env
+.venv/
+
