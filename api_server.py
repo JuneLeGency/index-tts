@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import torch
 import numpy as np
 import soundfile as sf
 import uvicorn
@@ -95,6 +96,7 @@ def concat_audio(arrays: list[np.ndarray], sr: int, silence_ms: int = SILENCE_MS
 def _do_infer(ref_path: str, chunks: list[str], emo_text: str | None,
               emo_audio_path: str | None, emo_alpha: float) -> tuple[list[np.ndarray], int, float]:
     """Core inference loop shared by both endpoints. Returns (audio_arrays, sample_rate, total_time)."""
+    torch.cuda.empty_cache()
     audio_arrays: list[np.ndarray] = []
     sample_rate = None
     total_inference = 0.0
@@ -141,6 +143,7 @@ def _do_infer(ref_path: str, chunks: list[str], emo_text: str | None,
 def _do_infer_streaming(ref_path: str, chunks: list[str], emo_text: str | None,
                         emo_audio_path: str | None, emo_alpha: float):
     """Generator that yields (index, audio_data, sample_rate, inference_time) per chunk."""
+    torch.cuda.empty_cache()
     for i, chunk in enumerate(chunks):
         logger.info("  [Stream] Chunk %d/%d (%d chars): %s...",
                     i + 1, len(chunks), len(chunk), chunk[:40])
