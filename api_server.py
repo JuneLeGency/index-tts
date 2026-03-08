@@ -6,10 +6,12 @@ Supports:
   - Custom voice cloning from reference audio: /v1/tts
   - Emotion control via emo_text, emo_audio, or emo_alpha
   - Automatic text chunking for long texts
+  - NDJSON streaming mode (stream=true) for chunk-by-chunk delivery
 """
 
 import base64
 import io
+import json
 import logging
 import os
 import re
@@ -24,6 +26,7 @@ import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 logger = logging.getLogger("indextts-server")
 
@@ -135,6 +138,81 @@ def _do_infer(ref_path: str, chunks: list[str], emo_text: str | None,
     return audio_arrays, sample_rate, total_inference
 
 
+def _do_infer_streaming(ref_path: str, chunks: list[str], emo_text: str | None,
+                        emo_audio_path: str | None, emo_alpha: float):
+    """Generator that yields (index, audio_data, sample_rate, inference_time) per chunk."""
+    for i, chunk in enumerate(chunks):
+        logger.info("  [Stream] Chunk %d/%d (%d chars): %s...",
+                    i + 1, len(chunks), len(chunk), chunk[:40])
+        out_path = tempfile.mktemp(suffix=".wav")
+
+        try:
+            t0 = time.time()
+            kwargs = {}
+            if emo_text:
+                kwargs["use_emo_text"] = True
+                kwargs["emo_text"] = emo_text
+            if emo_audio_path:
+                kwargs["emo_audio_prompt"] = emo_audio_path
+            if emo_alpha != 1.0:
+                kwargs["emo_alpha"] = emo_alpha
+
+            tts_model.infer(
+                spk_audio_prompt=ref_path,
+                text=chunk,
+                output_path=out_path,
+                **kwargs,
+            )
+            elapsed = time.time() - t0
+
+            data, sr = sf.read(out_path)
+            yield i, data, sr, elapsed
+        finally:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+
+
+def _chunk_to_wav_base64(audio_data: np.ndarray, sample_rate: int) -> str:
+    """Encode a single audio chunk as a complete, playable WAV in base64."""
+    buf = io.BytesIO()
+    sf.write(buf, audio_data, sample_rate, format="WAV")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _ndjson_stream(ref_path: str, chunks: list[str], emo_text: str | None,
+                   emo_audio_path: str | None, emo_alpha: float):
+    """Generator yielding NDJSON lines: one per chunk + a final done event."""
+    total_chunks = len(chunks)
+    total_duration = 0.0
+    last_sr = 0
+
+    for idx, audio_data, sr, _elapsed in _do_infer_streaming(
+        ref_path, chunks, emo_text, emo_audio_path, emo_alpha
+    ):
+        duration = len(audio_data) / sr
+        total_duration += duration
+        last_sr = sr
+        line = json.dumps({
+            "event": "chunk",
+            "index": idx,
+            "total": total_chunks,
+            "audio_base64": _chunk_to_wav_base64(audio_data, sr),
+            "sample_rate": sr,
+            "duration_seconds": round(duration, 3),
+        })
+        yield line + "\n"
+
+    done_line = json.dumps({
+        "event": "done",
+        "total_chunks": total_chunks,
+        "total_duration_seconds": round(total_duration, 3),
+        "sample_rate": last_sr,
+    })
+    yield done_line + "\n"
+
+
 def _build_response(audio_arrays: list[np.ndarray], sample_rate: int,
                     total_inference: float, n_chunks: int) -> dict:
     """Build the standard response dict."""
@@ -183,6 +261,7 @@ class TTSRequest(BaseModel):
     emo_audio_base64: Optional[str] = Field(default=None, description="Base64-encoded emotion reference audio")
     emo_alpha: float = Field(default=1.0, ge=0.0, le=2.0, description="Emotion intensity")
     format: str = Field(default="wav", description="Output format")
+    stream: bool = Field(default=False, description="Stream chunks as NDJSON lines")
 
 
 class PresetTTSRequest(BaseModel):
@@ -190,6 +269,7 @@ class PresetTTSRequest(BaseModel):
     voice: str = Field(default="default", description="Preset voice name (default, female_zh, male_zh, female_en, male_en)")
     emo_text: Optional[str] = Field(default=None, description="Emotion description text")
     emo_alpha: float = Field(default=1.0, ge=0.0, le=2.0, description="Emotion intensity")
+    stream: bool = Field(default=False, description="Stream chunks as NDJSON lines")
 
 
 class TTSResponse(BaseModel):
@@ -229,18 +309,24 @@ async def synthesize_preset(req: PresetTTSRequest):
     ref_path = _PRESET_VOICES.get(req.voice)
     if not ref_path:
         raise HTTPException(400,
-            f"Unknown preset voice '{req.voice}'. "
+            f"Unknown preset voice {req.voice}. "
             f"Available: {list(_PRESET_VOICES.keys())}")
 
     chunks = split_text(req.text)
     if not chunks:
         raise HTTPException(400, "Empty text")
 
-    logger.info("[Preset] voice=%s, %d chunk(s), %d chars, emo_text=%s",
+    logger.info("[Preset] voice=%s, %d chunk(s), %d chars, emo_text=%s, stream=%s",
                 req.voice, len(chunks), len(req.text),
-                f"'{req.emo_text}'" if req.emo_text else "None")
+                f"{req.emo_text}" if req.emo_text else "None",
+                req.stream)
 
     try:
+        if req.stream:
+            return StreamingResponse(
+                _ndjson_stream(ref_path, chunks, req.emo_text, None, req.emo_alpha),
+                media_type="application/x-ndjson",
+            )
         arrays, sr, t = _do_infer(ref_path, chunks, req.emo_text, None, req.emo_alpha)
         return _build_response(arrays, sr, t, len(chunks))
     except Exception as e:
@@ -283,24 +369,44 @@ async def synthesize(req: TTSRequest):
             os.unlink(emo_audio_path)
         raise HTTPException(400, "Empty text")
 
-    logger.info("[Clone] %d chunk(s), %d chars, emo_text=%s, emo_audio=%s, emo_alpha=%.1f",
+    logger.info("[Clone] %d chunk(s), %d chars, emo_text=%s, emo_audio=%s, emo_alpha=%.1f, stream=%s",
                 len(chunks), len(req.text),
-                f"'{req.emo_text}'" if req.emo_text else "None",
+                f"{req.emo_text}" if req.emo_text else "None",
                 "yes" if emo_audio_path else "no",
-                req.emo_alpha)
+                req.emo_alpha,
+                req.stream)
 
     try:
+        if req.stream:
+            def _streaming_with_cleanup():
+                try:
+                    yield from _ndjson_stream(
+                        ref_path, chunks, req.emo_text, emo_audio_path, req.emo_alpha
+                    )
+                finally:
+                    for p in [ref_path] + ([emo_audio_path] if emo_audio_path else []):
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+
+            return StreamingResponse(
+                _streaming_with_cleanup(),
+                media_type="application/x-ndjson",
+            )
+
         arrays, sr, t = _do_infer(ref_path, chunks, req.emo_text, emo_audio_path, req.emo_alpha)
         return _build_response(arrays, sr, t, len(chunks))
     except Exception as e:
         logger.exception("IndexTTS2 inference failed")
         raise HTTPException(500, f"Inference failed: {e}")
     finally:
-        for p in [ref_path] + ([emo_audio_path] if emo_audio_path else []):
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
+        if not req.stream:
+            for p in [ref_path] + ([emo_audio_path] if emo_audio_path else []):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":
