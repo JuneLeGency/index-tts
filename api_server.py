@@ -243,6 +243,7 @@ async def lifespan(app: FastAPI):
         cfg_path="checkpoints/config.yaml",
         model_dir="checkpoints",
         device="cuda:0",
+        use_fp16=True,
     )
     logger.info("IndexTTS2 loaded in %.1fs", time.time() - t0)
     logger.info("Loading preset voices from %s ...", PRESETS_DIR)
