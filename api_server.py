@@ -38,8 +38,15 @@ PRESETS_DIR = Path(__file__).parent / "presets"
 _PRESET_VOICES: dict[str, str] = {}  # name -> abs path, populated at startup
 
 # --- Chunking config ---
-MAX_CHUNK_CHARS = 150
+# IndexTTS handles long text natively via `max_text_tokens_per_segment=120` —
+# the model internally splits into segments and synthesizes them with shared
+# context (timbre stays coherent within a single infer() call). Our outer
+# split_text() was actually *defeating* that by making N independent infer()
+# calls. We now keep an outer cap only as a safety net for very long inputs;
+# normal long-form requests should fall through as a single infer().
+MAX_CHUNK_CHARS = int(os.environ.get("INDEXTTS_MAX_CHUNK_CHARS", "1000"))
 SILENCE_MS = 300
+INDEXTTS_CROSSFADE_MS = int(os.environ.get("INDEXTTS_CROSSFADE_MS", "80"))
 
 
 def _load_presets() -> dict[str, str]:
@@ -80,17 +87,38 @@ def split_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     return chunks
 
 
-def concat_audio(arrays: list[np.ndarray], sr: int, silence_ms: int = SILENCE_MS) -> np.ndarray:
-    """Concatenate audio arrays with silence padding between them."""
+def crossfade_concat(
+    arrays: list[np.ndarray], sr: int, fade_ms: int = INDEXTTS_CROSSFADE_MS
+) -> np.ndarray:
+    """Equal-power cosine cross-fade between consecutive chunks; eliminates the
+    click/attack at chunk boundaries that 300ms zero-padding leaves behind."""
     if len(arrays) == 1:
         return arrays[0]
-    silence = np.zeros(int(sr * silence_ms / 1000), dtype=arrays[0].dtype)
-    parts: list[np.ndarray] = []
-    for i, arr in enumerate(arrays):
-        parts.append(arr)
-        if i < len(arrays) - 1:
-            parts.append(silence)
-    return np.concatenate(parts)
+    if fade_ms <= 0:
+        return np.concatenate(arrays)
+    fade_n = max(1, int(sr * fade_ms / 1000))
+    out_dtype = arrays[0].dtype
+    parts: list[np.ndarray] = [arrays[0].astype(np.float32, copy=False)]
+    for nxt in arrays[1:]:
+        nxt_f = nxt.astype(np.float32, copy=False)
+        prev = parts[-1]
+        n = min(fade_n, len(prev), len(nxt_f))
+        if n <= 0:
+            parts.append(nxt_f)
+            continue
+        t = np.linspace(0.0, np.pi, n, dtype=np.float32)
+        fade_out = np.sqrt(0.5 * (1.0 + np.cos(t)))
+        fade_in = np.sqrt(0.5 * (1.0 - np.cos(t)))
+        mixed = prev[-n:] * fade_out + nxt_f[:n] * fade_in
+        parts[-1] = prev[:-n]
+        parts.append(mixed)
+        parts.append(nxt_f[n:])
+    return np.concatenate(parts).astype(out_dtype, copy=False)
+
+
+def concat_audio(arrays: list[np.ndarray], sr: int, silence_ms: int = SILENCE_MS) -> np.ndarray:
+    """Backwards-compat alias — now performs cross-fade instead of zero-padding."""
+    return crossfade_concat(arrays, sr)
 
 
 def _do_infer(ref_path: str, chunks: list[str], emo_text: str | None,
